@@ -1,0 +1,20 @@
+# Bytecode caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+
+# Editor / OS files
+.vscode/
+.DS_Store
+
+# Workspace files
+*.code-workspace
+
+# Development notes and refactoring documentation (local only)
+dev-notes/
+
+# Temporary files
+tempCodeRunnerFile.py
+pickles/
