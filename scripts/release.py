@@ -10,7 +10,6 @@ The changes.md file is always included when provided.
 """
 
 import json
-import mimetypes
 import os
 import sys
 from pathlib import Path
@@ -43,7 +42,7 @@ def create_release(
     server: str,
     build: int,
     changed_langs: list[str],
-    changes_md_path: Path | None = None,
+    changes_md_path=None,
     body: str = "",
     draft: bool = False,
 ) -> str:
@@ -61,65 +60,81 @@ def create_release(
     tag = f"{server_lower}-{build}"
     release_name = f"EVE Localization {server.upper()} Build {build}"
 
-    # ------------------------------------------------------------------
-    # Create release
-    # ------------------------------------------------------------------
     api_base = f"https://api.github.com/repos/{repo}"
     create_url = f"{api_base}/releases"
 
     payload = {
         "tag_name": tag,
         "name": release_name,
-        "body": body or f"Localization update for {server.upper()} build {build}.",
+        "body": body
+        or f"Localization update for {server.upper()} build {build}.",
         "draft": draft,
         "prerelease": (server_lower == "sisi"),
     }
 
+    # ------------------------------------------------------------------
+    # Create release (with orphan-tag recovery)
+    # ------------------------------------------------------------------
     r = requests.post(create_url, headers=headers, json=payload, timeout=30)
+
     if r.status_code == 422:
-        # 422 has two distinct causes:
-        #   (a) A release for this tag already exists → GET returns 200
-        #   (b) The git tag exists but has no release attached (e.g. release was
-        #       deleted from the UI without deleting the underlying tag) → GET returns 404
-        r2 = requests.get(f"{api_base}/releases/tags/{tag}", headers=headers, timeout=30)
+        # Log the raw body so we can diagnose unexpected cases.
+        print(f"POST /releases returned 422: {r.text}")
+
+        # Two possible causes:
+        #   (a) A release already exists for this tag  → GET /releases/tags/{tag} returns 200
+        #   (b) The git tag exists but has no release  → GET /releases/tags/{tag} returns 404
+        #       (happens when the release is deleted from the UI without deleting the tag)
+        r2 = requests.get(f"{api_base}/releases/tags/{tag}",
+                          headers=headers,
+                          timeout=30)
+        print(f"GET /releases/tags/{tag} → HTTP {r2.status_code}")
 
         if r2.status_code == 200:
-            # Case (a): release exists, reuse it
+            # Case (a): reuse the existing release
             print(f"Release {tag} already exists, reusing.")
             release = r2.json()
 
         elif r2.status_code == 404:
-            # Case (b): orphan git tag with no release attached.
-            # Delete the dangling tag ref and retry.
+            # Case (b): orphan git tag — delete it and retry
             print(
-                f"Orphan git tag '{tag}' found (tag exists but release was deleted). "
-                "Deleting tag and retrying..."
-            )
-            r3 = requests.delete(
-                f"{api_base}/git/refs/tags/{tag}",
-                headers=headers,
-                timeout=30,
-            )
-            # 204 = deleted OK; anything else is unexpected
-            if r3.status_code != 204:
-                raise RuntimeError(
-                    f"Failed to delete orphan tag '{tag}': "
-                    f"HTTP {r3.status_code} {r3.text}"
-                )
+                f"Orphan git tag '{tag}' found (tag exists but no release attached). "
+                "Deleting tag ref and retrying release creation...")
+            delete_url = f"{api_base}/git/refs/tags/{tag}"
+            print(f"DELETE {delete_url}")
+            r3 = requests.delete(delete_url, headers=headers, timeout=30)
+            print(f"DELETE → HTTP {r3.status_code}  body: {r3.text!r}")
 
-            # Retry release creation now that the tag is gone
-            r = requests.post(create_url, headers=headers, json=payload, timeout=30)
+            if r3.status_code == 204:
+                pass  # deleted successfully
+            elif r3.status_code == 422:
+                # Ref already gone (race condition) — safe to proceed
+                print("Tag ref already absent (422 on DELETE); proceeding.")
+            else:
+                raise RuntimeError(
+                    f"Unexpected response deleting tag ref '{tag}': "
+                    f"HTTP {r3.status_code} — {r3.text}")
+
+            # Retry release creation
+            r = requests.post(create_url,
+                              headers=headers,
+                              json=payload,
+                              timeout=30)
+            if not r.ok:
+                print(f"Retry POST /releases → HTTP {r.status_code}: {r.text}")
             r.raise_for_status()
             release = r.json()
 
         else:
-            # Unexpected status on the GET — surface it
+            print(f"Unexpected GET status {r2.status_code}: {r2.text}")
             r2.raise_for_status()
+
     else:
         r.raise_for_status()
         release = r.json()
 
-    upload_url = release["upload_url"].split("{")[0]  # strip template suffix
+    upload_url = release["upload_url"].split("{")[
+        0]  # strip URI template suffix
     html_url = release["html_url"]
     print(f"Release: {html_url}")
 
@@ -152,7 +167,7 @@ def create_release(
     # ------------------------------------------------------------------
     # Upload changes.md
     # ------------------------------------------------------------------
-    if changes_md_path and changes_md_path.exists():
+    if changes_md_path and Path(changes_md_path).exists():
         print("  Uploading changes.md...")
         with open(changes_md_path, "rb") as f:
             data = f.read()
@@ -175,7 +190,8 @@ def create_release(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Create GitHub Release for EVE localization.")
+    parser = argparse.ArgumentParser(
+        description="Create GitHub Release for EVE localization.")
     parser.add_argument("server", choices=["TQ", "SISI", "tq", "sisi"])
     parser.add_argument("build", type=int)
     parser.add_argument("langs", nargs="+", help="Changed language codes")
