@@ -18,3 +18,5 @@ dev-notes/
 # Temporary files
 tempCodeRunnerFile.py
 pickles/
+state/*-pending-release.json
+changes.md

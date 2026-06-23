@@ -1,246 +1,379 @@
 """
 changelog.py – Generate Markdown changelogs for EVE localization updates.
 
-Reads current latest/{server}/*.json files and compares them against the
-previous versions from the GitHub Release for the previous build.
-
-Output
-------
-A single Markdown file: changes.md (for release assets)
-Appended section in:   CHANGELOG_TQ.md / CHANGELOG_SISI.md
+Per-MessageID grouping: all languages for the same MessageID are rendered
+together, with EN shown once.  Smart diff collapses unchanged lines with […].
 """
 
+import difflib
 import json
-import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 LATEST_DIR = ROOT / "latest"
 
-TRUNC_LIMIT = 500  # characters before we truncate long strings
+TRUNC_LIMIT = 500  # chars for plain-text (non-diff) blocks
+CONTEXT_LINES = 2  # surrounding unchanged lines kept in multi-line diffs
+CHAR_CONTEXT = 40  # chars of context kept around inline single-line changes
 
 # ---------------------------------------------------------------------------
-# Text helpers
+# Low-level text helpers
 # ---------------------------------------------------------------------------
 
 
-def truncate(text: str) -> tuple[str, bool]:
-    """Return (possibly-truncated text, was_truncated)."""
+def _truncate(text: str) -> tuple[str, bool]:
     if len(text) <= TRUNC_LIMIT:
         return text, False
     return text[:TRUNC_LIMIT], True
 
 
-def fmt_block(lang_key: str, text: str, style: str = "text") -> str:
-    """Render a fenced code block for *lang_key* and *text*."""
-    display, was_truncated = truncate(text)
-    lines = [f"{lang_key.upper()}", "", f"```{style}", display]
-    if was_truncated:
-        lines.append(f"(truncated, {len(text):,} chars total)")
-    lines += ["```", ""]
-    return "\n".join(lines)
+def _empty_group(langs: list[str]) -> str:
+    """'ZH, ES, and RU: *empty*' notice."""
+    upper = [code.upper() for code in sorted(langs)]
+    if len(upper) == 1:
+        phrase = upper[0]
+    elif len(upper) == 2:
+        phrase = f"{upper[0]} and {upper[1]}"
+    else:
+        phrase = ", ".join(upper[:-1]) + f", and {upper[-1]}"
+    return f"{phrase}: *empty*\n\n"
 
 
-def diff_block(lang_key: str, old: str, new: str) -> str:
-    """Render a diff block for *lang_key*."""
-    old_trunc, old_was = truncate(old)
-    new_trunc, new_was = truncate(new)
-
-    if old_was or new_was:
-        # Too long – show plain blocks instead of diff
-        return (
-            f"{lang_key.upper()} (before)\n\n"
-            f"```text\n{old_trunc}" +
-            (f"\n(truncated, {len(old):,} chars total)" if old_was else "") +
-            f"\n```\n\n"
-            f"{lang_key.upper()} (after)\n\n"
-            f"```text\n{new_trunc}" +
-            (f"\n(truncated, {len(new):,} chars total)" if new_was else "") +
-            "\n```\n")
-
-    return (f"{lang_key.upper()}\n\n"
-            f"```diff\n"
-            f"- {old}\n"
-            f"+ {new}\n"
-            f"```\n")
+def fmt_block(lang_key: str, text: str) -> str:
+    """Plain ```text block.  Empty values render as inline *empty*."""
+    if not text:
+        return f"{lang_key.upper()}: *empty*\n\n"
+    display, truncated = _truncate(text)
+    parts = [f"{lang_key.upper()}", "", "```text", display]
+    if truncated:
+        parts.append(f"(truncated, {len(text):,} chars total)")
+    parts += ["```", ""]
+    return "\n".join(parts) + "\n"
 
 
 # ---------------------------------------------------------------------------
-# Load JSON helpers
+# Smart diff helpers
+# ---------------------------------------------------------------------------
+
+
+def _single_line_diff(old: str, new: str) -> str:
+    """
+    Compact diff for a pair of single-line strings.
+    Uses [...] to elide long unchanged prefix/suffix.
+    """
+    pfx_len = 0
+    for a, b in zip(old, new):
+        if a == b:
+            pfx_len += 1
+        else:
+            break
+
+    sfx_len = 0
+    max_sfx = min(len(old) - pfx_len, len(new) - pfx_len)
+    for i in range(1, max_sfx + 1):
+        if old[-i] == new[-i]:
+            sfx_len += 1
+        else:
+            break
+
+    prefix = old[:pfx_len]
+    suffix = old[len(old) - sfx_len:] if sfx_len else ""
+    old_mid = old[pfx_len:len(old) - sfx_len if sfx_len else len(old)]
+    new_mid = new[pfx_len:len(new) - sfx_len if sfx_len else len(new)]
+
+    pfx_disp = f"[…]{prefix[-CHAR_CONTEXT:]}" if len(
+        prefix) > CHAR_CONTEXT else prefix
+    sfx_disp = f"{suffix[:CHAR_CONTEXT]}[…]" if len(
+        suffix) > CHAR_CONTEXT else suffix
+
+    return f"- {pfx_disp}{old_mid}{sfx_disp}\n+ {pfx_disp}{new_mid}{sfx_disp}"
+
+
+def _equal_block_lines(old_lines: list[str], i1: int, i2: int, is_first: bool,
+                       is_last: bool) -> list[str]:
+    """Context lines for one equal opcode block, with […] collapsing."""
+    n = i2 - i1
+    if n <= CONTEXT_LINES * 2:
+        return [f"  {line}" for line in old_lines[i1:i2]]
+    out = []
+    if not is_first:
+        out.extend(f"  {line}" for line in old_lines[i1:i1 + CONTEXT_LINES])
+    out.append("[…]")
+    if not is_last:
+        out.extend(f"  {line}" for line in old_lines[i2 - CONTEXT_LINES:i2])
+    return out
+
+
+def _multiline_diff_lines(old_lines: list[str],
+                          new_lines: list[str]) -> list[str]:
+    """Unified diff lines with […] collapsing of unchanged sections."""
+    matcher = difflib.SequenceMatcher(None,
+                                      old_lines,
+                                      new_lines,
+                                      autojunk=False)
+    opcodes = list(matcher.get_opcodes())
+    n_ops = len(opcodes)
+    result = []
+    for i, (tag, i1, i2, j1, j2) in enumerate(opcodes):
+        if tag == "equal":
+            result.extend(
+                _equal_block_lines(old_lines, i1, i2, i == 0, i == n_ops - 1))
+        elif tag in ("replace", "delete"):
+            result.extend(f"- {line}" for line in old_lines[i1:i2])
+            if tag == "replace":
+                result.extend(f"+ {line}" for line in new_lines[j1:j2])
+        elif tag == "insert":
+            result.extend(f"+ {line}" for line in new_lines[j1:j2])
+    return result
+
+
+def smart_diff_block(lang_key: str, old: str, new: str) -> str:
+    """
+    ```diff block with […] collapsing of unchanged sections.
+
+    Single-line: character-level context around the change.
+    Multi-line:  CONTEXT_LINES surrounding lines kept; rest collapsed.
+    """
+    old_lines = old.splitlines()
+    new_lines = new.splitlines()
+
+    if len(old_lines) <= 1 and len(new_lines) <= 1:
+        o = old_lines[0] if old_lines else ""
+        n = new_lines[0] if new_lines else ""
+        content = _single_line_diff(o, n)
+    else:
+        content = "\n".join(_multiline_diff_lines(old_lines, new_lines))
+
+    return f"{lang_key.upper()}\n\n```diff\n{content}\n```\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Per-language diff computation
+# ---------------------------------------------------------------------------
+
+
+def compute_diff(old: dict, new: dict, lang: str) -> dict:
+    added, removed, src_mod, tr_mod = {}, {}, {}, {}
+    for msg_id in set(old) | set(new):
+        if msg_id not in old:
+            added[msg_id] = new[msg_id]
+        elif msg_id not in new:
+            removed[msg_id] = old[msg_id]
+        else:
+            o, n = old[msg_id], new[msg_id]
+            en_changed = o.get("en", "") != n.get("en", "")
+            tr_changed = lang != "en" and o.get(lang, "") != n.get(lang, "")
+            if en_changed:
+                src_mod[msg_id] = {"old": o, "new": n}
+            elif tr_changed:
+                tr_mod[msg_id] = {"old": o, "new": n}
+    return {
+        "added": added,
+        "removed": removed,
+        "src_mod": src_mod,
+        "tr_mod": tr_mod
+    }
+
+
+# ---------------------------------------------------------------------------
+# Pivot: per-lang diffs  →  per-MessageID structure
+# ---------------------------------------------------------------------------
+#
+# per_msg[msg_id] = {
+#   "primary":    "added"|"removed"|"src_mod"|"tr_mod",
+#   "en_old":     str,
+#   "en_new":     str,
+#   "en_changed": bool,
+#   "langs": {
+#       lang: { "type": str, "tr_old": str, "tr_new": str }
+#   }
+# }
+
+
+def pivot_diffs(diffs: dict) -> dict:
+    per_msg: dict = {}
+
+    def get(msg_id: str, primary: str) -> dict:
+        if msg_id not in per_msg:
+            per_msg[msg_id] = {
+                "primary": primary,
+                "en_old": "",
+                "en_new": "",
+                "en_changed": False,
+                "langs": {},
+            }
+        return per_msg[msg_id]
+
+    for lang, d in diffs.items():
+        for msg_id, entry in d["added"].items():
+            m = get(msg_id, "added")
+            m["en_new"] = entry.get("en", "")
+            if lang != "en":
+                m["langs"][lang] = {
+                    "type": "added",
+                    "tr_old": "",
+                    "tr_new": entry.get(lang, "")
+                }
+
+        for msg_id, entry in d["removed"].items():
+            m = get(msg_id, "removed")
+            m["en_old"] = entry.get("en", "")
+            if lang != "en":
+                m["langs"][lang] = {
+                    "type": "removed",
+                    "tr_old": entry.get(lang, ""),
+                    "tr_new": ""
+                }
+
+        for msg_id, data in d["src_mod"].items():
+            m = get(msg_id, "src_mod")
+            m["en_old"] = data["old"].get("en", "")
+            m["en_new"] = data["new"].get("en", "")
+            m["en_changed"] = True
+            if lang != "en":
+                m["langs"][lang] = {
+                    "type": "src_mod",
+                    "tr_old": data["old"].get(lang, ""),
+                    "tr_new": data["new"].get(lang, ""),
+                }
+
+        for msg_id, data in d["tr_mod"].items():
+            m = get(msg_id, "tr_mod")
+            m["en_new"] = m["en_old"] = data["new"].get("en", "")
+            if lang != "en":
+                m["langs"][lang] = {
+                    "type": "tr_mod",
+                    "tr_old": data["old"].get(lang, ""),
+                    "tr_new": data["new"].get(lang, ""),
+                }
+
+    return per_msg
+
+
+# ---------------------------------------------------------------------------
+# Render one MessageID entry (all languages together)
+# ---------------------------------------------------------------------------
+
+
+def _render_langs_plain(langs_data: dict, value_key: str) -> list[str]:
+    """Translation blocks for Added/Removed (plain text, empties grouped)."""
+    out: list[str] = []
+    empty: list[str] = []
+    for lang, ldata in sorted(langs_data.items()):
+        if val := ldata[value_key]:
+            out.append(fmt_block(lang, val))
+        else:
+            empty.append(lang)
+    if empty:
+        out.append(_empty_group(empty))
+    return out
+
+
+def _render_langs_modified(langs_data: dict) -> list[str]:
+    """
+    Translation blocks for src_mod / tr_mod.
+    Changed → smart diff.  Unchanged → plain block.  Empty → grouped notice.
+    """
+    out: list[str] = []
+    empty: list[str] = []
+    for lang, ldata in sorted(langs_data.items()):
+        tr_old, tr_new = ldata["tr_old"], ldata["tr_new"]
+        if not tr_new:
+            empty.append(lang)
+        elif tr_old == tr_new:
+            out.append(fmt_block(lang, tr_new))
+        else:
+            out.append(smart_diff_block(lang, tr_old, tr_new))
+    if empty:
+        out.append(_empty_group(empty))
+    return out
+
+
+def render_msg_entry(msg_id: str, msg_data: dict) -> str:
+    primary = msg_data["primary"]
+    en_old = msg_data["en_old"]
+    en_new = msg_data["en_new"]
+    langs = msg_data["langs"]
+
+    parts = [f"**MessageID: {msg_id}**", ""]
+
+    if primary == "added":
+        parts += ["### Added", "", fmt_block("en", en_new)]
+        parts += _render_langs_plain(langs, "tr_new")
+    elif primary == "removed":
+        parts += ["### Removed", "", fmt_block("en", en_old)]
+        parts += _render_langs_plain(langs, "tr_old")
+    elif primary == "src_mod":
+        parts += [
+            "### Source Modified", "",
+            smart_diff_block("en", en_old, en_new)
+        ]
+        parts += _render_langs_modified(langs)
+    elif primary == "tr_mod":
+        parts += ["### Translation Modified", "", fmt_block("en", en_new)]
+        parts += _render_langs_modified(langs)
+
+    return "\n".join(parts) + "\n\n"
+
+
+# ---------------------------------------------------------------------------
+# Summary table
+# ---------------------------------------------------------------------------
+
+
+def _summary_row(lang: str, d: dict) -> str:
+    modified = len(d["src_mod"]) + len(d["tr_mod"])
+    return f"| {lang} | {len(d['added'])} | {modified} | {len(d['removed'])} |"
+
+
+def _render_summary(build: int, diffs: dict) -> str:
+    rows = [_summary_row(lang, d) for lang, d in sorted(diffs.items())]
+    table = ("| Language | Added | Modified | Removed |\n"
+             "|----------|-------|----------|---------|\n" + "\n".join(rows))
+    return f"# Build {build}\n\n## Summary\n\n{table}\n"
+
+
+# ---------------------------------------------------------------------------
+# Full changelog render
+# ---------------------------------------------------------------------------
+
+
+def render_changes_md(build: int, diffs: dict) -> str:
+    per_msg = pivot_diffs(diffs)
+
+    def sort_key(mid: str) -> tuple:
+        try:
+            return (0, int(mid))
+        except ValueError:
+            return (1, mid)
+
+    detail_parts = ["## Details", ""]
+    for msg_id in sorted(per_msg, key=sort_key):
+        detail_parts.append(render_msg_entry(msg_id, per_msg[msg_id]))
+
+    return _render_summary(build, diffs) + "\n" + "\n".join(detail_parts)
+
+
+# ---------------------------------------------------------------------------
+# Cumulative changelog
+# ---------------------------------------------------------------------------
+
+
+def prepend_to_changelog(changelog_path: Path, new_section: str) -> None:
+    existing = changelog_path.read_text(
+        encoding="utf-8") if changelog_path.exists() else ""
+    sep = "\n---\n\n" if existing else ""
+    changelog_path.write_text(new_section + sep + existing, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# JSON loader
 # ---------------------------------------------------------------------------
 
 
 def load_json(path: Path) -> dict:
     return json.loads(path.read_text(
         encoding="utf-8")) if path.exists() else {}
-
-
-# ---------------------------------------------------------------------------
-# Diff computation
-# ---------------------------------------------------------------------------
-
-
-def compute_diff(old: dict, new: dict, lang: str) -> dict:
-    """
-    Compare old and new merged JSON for *lang*.
-
-    Both dicts are { msg_id: { "en": str, lang: str } }.
-
-    Returns:
-      {
-        "added":     { msg_id: new_entry },
-        "removed":   { msg_id: old_entry },
-        "src_mod":   { msg_id: { "old": old_entry, "new": new_entry } },
-        "tr_mod":    { msg_id: { "old": old_entry, "new": new_entry } },
-      }
-    """
-    added = {}
-    removed = {}
-    src_mod = {}
-    tr_mod = {}
-
-    all_ids = set(old.keys()) | set(new.keys())
-    for msg_id in all_ids:
-        if msg_id not in old:
-            added[msg_id] = new[msg_id]
-        elif msg_id not in new:
-            removed[msg_id] = old[msg_id]
-        else:
-            o = old[msg_id]
-            n = new[msg_id]
-            en_changed = o.get("en", "") != n.get("en", "")
-            tr_changed = o.get(lang, "") != n.get(lang, "")
-
-            if en_changed:
-                src_mod[msg_id] = {"old": o, "new": n}
-            elif tr_changed:
-                tr_mod[msg_id] = {"old": o, "new": n}
-
-    return {
-        "added": added,
-        "removed": removed,
-        "src_mod": src_mod,
-        "tr_mod": tr_mod,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Markdown rendering
-# ---------------------------------------------------------------------------
-
-
-def _render_summary(build: int, diffs: dict[str, dict]) -> str:
-    rows = []
-    for lang, d in sorted(diffs.items()):
-        added = len(d["added"])
-        modified = len(d["src_mod"]) + len(d["tr_mod"])
-        removed = len(d["removed"])
-        rows.append(f"| {lang} | {added} | {modified} | {removed} |")
-
-    table = ("| Language | Added | Modified | Removed |\n"
-             "|----------|-------|----------|---------|\n" + "\n".join(rows))
-    return f"# Build {build}\n\n## Summary\n\n{table}\n"
-
-
-def _render_entry(msg_id: str, category: str, entry_data: dict,
-                  lang: str) -> str:
-    """Render a single changelog entry."""
-    lines = [f"**MessageID: {msg_id}**", ""]
-
-    if category == "added":
-        lines.append("### Added")
-        lines.append("")
-        lines.append(fmt_block("en", entry_data.get("en", "")))
-        if lang != "en":
-            lines.append(fmt_block(lang, entry_data.get(lang, "")))
-
-    elif category == "removed":
-        lines.append("### Removed")
-        lines.append("")
-        lines.append(fmt_block("en", entry_data.get("en", "")))
-        if lang != "en":
-            lines.append(fmt_block(lang, entry_data.get(lang, "")))
-
-    elif category == "tr_mod":
-        old_entry = entry_data["old"]
-        new_entry = entry_data["new"]
-        lines.append("### Translation Modified")
-        lines.append("")
-        lines.append(fmt_block("en", new_entry.get("en", "")))
-        lines.append(
-            diff_block(lang, old_entry.get(lang, ""), new_entry.get(lang, "")))
-
-    elif category == "src_mod":
-        old_entry = entry_data["old"]
-        new_entry = entry_data["new"]
-        lines.append("### Source Modified")
-        lines.append("")
-        lines.append(
-            diff_block("en", old_entry.get("en", ""), new_entry.get("en", "")))
-        if lang != "en":
-            en_changed = old_entry.get("en", "") != new_entry.get("en", "")
-            tr_changed = old_entry.get(lang, "") != new_entry.get(lang, "")
-            if tr_changed:
-                lines.append(
-                    diff_block(lang, old_entry.get(lang, ""),
-                               new_entry.get(lang, "")))
-            else:
-                lines.append(fmt_block(lang, new_entry.get(lang, "")))
-
-    return "\n".join(lines) + "\n\n"
-
-
-def _collect_detail_events(
-        diffs: dict[str, dict]) -> list[tuple[str, str, str, dict]]:
-    """
-    Collect all events as (msg_id, lang, category, data) and sort by msg_id.
-    """
-    events = []
-    for lang, d in diffs.items():
-        for msg_id, entry in d["added"].items():
-            events.append((msg_id, lang, "added", entry))
-        for msg_id, entry in d["removed"].items():
-            events.append((msg_id, lang, "removed", entry))
-        for msg_id, entry in d["tr_mod"].items():
-            events.append((msg_id, lang, "tr_mod", entry))
-        for msg_id, entry in d["src_mod"].items():
-            events.append((msg_id, lang, "src_mod", entry))
-
-    # Sort by numeric msg_id where possible
-    def sort_key(e):
-        try:
-            return (int(e[0]), e[1])
-        except ValueError:
-            return (float("inf"), e[0], e[1])
-
-    events.sort(key=sort_key)
-    return events
-
-
-def render_changes_md(build: int, diffs: dict[str, dict]) -> str:
-    """Render the full changes.md content."""
-    summary = _render_summary(build, diffs)
-    events = _collect_detail_events(diffs)
-
-    detail_lines = ["## Details\n"]
-    detail_lines.extend(
-        _render_entry(msg_id, category, data, lang)
-        for msg_id, lang, category, data in events)
-    return summary + "\n" + "\n".join(detail_lines)
-
-
-# ---------------------------------------------------------------------------
-# Cumulative changelog update
-# ---------------------------------------------------------------------------
-
-
-def prepend_to_changelog(changelog_path: Path, new_section: str) -> None:
-    """Prepend *new_section* to the cumulative changelog file."""
-    existing = changelog_path.read_text(
-        encoding="utf-8") if changelog_path.exists() else ""
-    separator = "\n---\n\n" if existing else ""
-    changelog_path.write_text(new_section + separator + existing,
-                              encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -252,33 +385,26 @@ def generate_changelog(
     server: str,
     build: int,
     changed_langs: list[str],
-    old_json_dir: Path | None = None,
-) -> tuple[str, dict]:
+    old_json_dir=None,
+) -> tuple[str, str, dict]:
     """
-    Generate changelog for *changed_langs* on *server*.
-
-    *old_json_dir*: directory containing previous JSON files.
-      Defaults to latest/{server}/ (before the new files are written).
-      In practice, pass the path to JSON files extracted from the previous release.
-
-    Returns (changes_md_text, diffs_dict).
+    Returns (summary_md, full_md, diffs).
+    summary_md  – just the table (for release body)
+    full_md     – summary + details (for changes.md artifact and cumulative log)
     """
     server_lower = server.lower()
     new_dir = LATEST_DIR / server_lower
-    prev_dir = old_json_dir or (LATEST_DIR / server_lower)
+    prev_dir = Path(
+        old_json_dir) if old_json_dir else LATEST_DIR / server_lower
 
     diffs = {}
     for lang in changed_langs:
-        output_key = "en" if lang == "en-us" else lang
-        new_path = new_dir / f"{output_key}.json"
-        old_path = prev_dir / f"{output_key}.json"
-
-        new_data = load_json(new_path)
-        old_data = load_json(old_path)
-
-        diff = compute_diff(old_data, new_data, output_key)
+        key = "en" if lang == "en-us" else lang
+        new_data = load_json(new_dir / f"{key}.json")
+        old_data = load_json(prev_dir / f"{key}.json")
+        diff = compute_diff(old_data, new_data, key)
         if any(diff.values()):
-            diffs[output_key] = diff
+            diffs[key] = diff
 
     if not diffs:
         return "", "", {}
@@ -295,33 +421,21 @@ def generate_changelog(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(
-        description="Generate EVE localization changelog.")
+    parser = argparse.ArgumentParser()
     parser.add_argument("server", choices=["TQ", "SISI", "tq", "sisi"])
     parser.add_argument("build", type=int)
-    parser.add_argument("langs",
-                        nargs="+",
-                        help='Changed language codes, e.g. zh ja')
-    parser.add_argument("--old-dir",
-                        type=Path,
-                        help="Directory with previous JSON files")
+    parser.add_argument("langs", nargs="+")
+    parser.add_argument("--old-dir", type=Path)
     parser.add_argument("--output", type=Path, default=Path("changes.md"))
     args = parser.parse_args()
 
-    summary, md, diffs = generate_changelog(
-        args.server.upper(),
-        args.build,
-        args.langs,
-        old_json_dir=args.old_dir,
-    )
-
+    summary, md, _ = generate_changelog(args.server.upper(),
+                                        args.build,
+                                        args.langs,
+                                        old_json_dir=args.old_dir)
     if md:
         args.output.write_text(md, encoding="utf-8")
         print(f"Wrote {args.output}")
-
-        # Also update cumulative changelog
-        changelog_file = ROOT / f"CHANGELOG_{args.server.upper()}.md"
-        prepend_to_changelog(changelog_file, md)
-        print(f"Updated {changelog_file}")
+        prepend_to_changelog(ROOT / f"CHANGELOG_{args.server.upper()}.md", md)
     else:
-        print("No changes detected; no changelog generated.")
+        print("No changes detected.")

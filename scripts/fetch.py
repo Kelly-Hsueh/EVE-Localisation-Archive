@@ -176,6 +176,15 @@ def fetch_server(server: str, force: bool = False) -> dict:
     prev_build = load_state_build(server)
     prev_hashes = load_state_hashes(server)
 
+    if not force and prev_build == build:
+        print(f"[{server}] Build {build} unchanged, skipping.")
+        return {
+            "server": server,
+            "build": build,
+            "changed": {},
+            "all_hashes": prev_hashes
+        }
+
     print(f"[{server}] Fetching resfileindex for build {build}...")
     resfileindex_url = get_resfileindex_url(build)
     resfileindex_content = get_text(resfileindex_url)

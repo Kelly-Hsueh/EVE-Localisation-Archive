@@ -46,7 +46,9 @@ def backup_latest(server: str) -> Path:
     return tmp  # empty dir – first run
 
 
-def process_server(server: str, force: bool = False) -> bool:
+def process_server(server: str,
+                   force: bool = False,
+                   no_release: bool = False) -> bool:
     """
     Run the full pipeline for *server*.
 
@@ -107,23 +109,43 @@ def process_server(server: str, force: bool = False) -> bool:
         print(f"[{server}] No diff content generated (possibly first run).")
 
     # ------------------------------------------------------------------
-    # 5. GitHub Release
+    # 5. GitHub Release (or write metadata for deferred creation)
     # ------------------------------------------------------------------
-    if os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPO"):
-        # Release body = summary table only; full diff is in the changes.md asset
+    meta_path = ROOT / "state" / f"{server.lower()}-pending-release.json"
+
+    if not md:
+        # Nothing actually changed (first run / no diffs) — clear any stale metadata
+        meta_path.unlink(missing_ok=True)
+    elif no_release:
+        # Deferred mode: write metadata so the workflow can create the release
+        # after committing and pushing (ensuring the release points to the right SHA).
+        meta = {
+            "server": server,
+            "build": build,
+            "changed_langs": changed_langs,
+            "changes_md": str(changes_path),
+            "summary": summary,
+        }
+        STATE_DIR = ROOT / "state"
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        print(f"[{server}] Release metadata written → {meta_path}")
+    elif os.environ.get("GITHUB_TOKEN") and os.environ.get("GITHUB_REPO"):
         body = summary or f"Localization update for {server} build {build}."
         url = release_module.create_release(
             server,
             build,
             changed_langs,
-            changes_md_path=changes_path if md else None,
+            changes_md_path=changes_path,
             body=body,
         )
         print(f"[{server}] Release created: {url}")
+        meta_path.unlink(missing_ok=True)
     else:
         msg = (f"\033[33m[{server}] [NOTICE] Skipping GitHub Release "
                f"(GITHUB_TOKEN or GITHUB_REPO not set).\033[0m")
         print(msg, file=sys.stderr)
+        meta_path.unlink(missing_ok=True)
 
     # Cleanup temp backup
     shutil.rmtree(old_json_dir.parent, ignore_errors=True)
@@ -151,12 +173,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Re-download all languages regardless of hash",
     )
+    parser.add_argument(
+        "--no-release",
+        action="store_true",
+        help="Skip release creation; write metadata "
+        "for deferred release after push",
+    )
     args = parser.parse_args()
 
     any_released = False
     for server in args.servers:
-        released = process_server(server.upper(), force=args.force)
+        released = process_server(server.upper(),
+                                  force=args.force,
+                                  no_release=args.no_release)
         any_released = any_released or released
 
-    sys.exit(
-        0 if any_released else 0)  # always exit 0; GH Actions checks outputs
+    sys.exit(0)

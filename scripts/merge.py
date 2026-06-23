@@ -21,7 +21,6 @@ ROOT = Path(__file__).resolve().parent.parent
 PICKLES_DIR = ROOT / "pickles"
 LATEST_DIR = ROOT / "latest"
 
-
 # ---------------------------------------------------------------------------
 # Pickle loading
 # ---------------------------------------------------------------------------
@@ -31,9 +30,7 @@ def load_pickle(path: Path) -> dict:
     """Load a localization pickle and return the message dict."""
     with open(path, "rb") as f:
         raw = pickle.load(f)
-    # The pickle is a tuple; index 1 holds the message dict.
-    data = raw[1]
-    return data
+    return raw[1]
 
 
 def extract_text(value) -> str:
@@ -94,10 +91,8 @@ def export_language(server: str, lang: str, pickle_path: Path) -> Path:
     en_pickle = PICKLES_DIR / server_lower / "localization_fsd_en-us.pickle"
 
     if lang != "en-us" and not en_pickle.exists():
-        raise FileNotFoundError(
-            f"English pickle not found at {en_pickle}. "
-            "Fetch en-us first or pass --force."
-        )
+        raise FileNotFoundError(f"English pickle not found at {en_pickle}. "
+                                "Fetch en-us first or pass --force.")
 
     # Normalise output language key: en-us → en
     output_key = "en" if lang == "en-us" else lang
@@ -151,14 +146,16 @@ def export_changed(server: str, changed: dict) -> dict[str, Path]:
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Merge EVE localization pickles to JSON.")
+    parser = argparse.ArgumentParser(
+        description="Merge EVE localization pickles to JSON.")
     parser.add_argument("server", choices=["TQ", "SISI", "tq", "sisi"])
     parser.add_argument("lang", help='Language code, e.g. "zh", "ja", "en-us"')
     args = parser.parse_args()
 
     server = args.server.upper()
     lang = args.lang.lower()
-    pickle_file = PICKLES_DIR / server.lower() / f"localization_fsd_{lang}.pickle"
+    pickle_file = PICKLES_DIR / server.lower(
+    ) / f"localization_fsd_{lang}.pickle"
     if not pickle_file.exists():
         print(f"Pickle not found: {pickle_file}")
         raise SystemExit(1)
