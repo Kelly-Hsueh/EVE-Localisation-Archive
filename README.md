@@ -20,8 +20,8 @@ scripts/
 ├── merge.py            ← export merged language JSON files
 ├── changelog.py        ← generate Markdown changelogs
 ├── release.py          ← create GitHub Releases with assets
-├── run.py              ← orchestrator (fetch → merge → changelog → release)
-└── merge_zh_en.py      ← original reference script
+├── create_release.py   ← create release from deferred metadata (post-push)
+└── run.py              ← orchestrator (fetch → merge → changelog → release)
 
 .github/workflows/
 └── localization.yml    ← daily GitHub Actions workflow
