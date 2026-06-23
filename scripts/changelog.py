@@ -289,28 +289,36 @@ def _render_langs_modified(langs_data: dict) -> list[str]:
     return out
 
 
+_PRIMARY_LABELS: dict[str, str] = {
+    "added": "Added",
+    "removed": "Removed",
+    "src_mod": "Source Modified",
+    "tr_mod": "Translation Modified",
+}
+
+
 def render_msg_entry(msg_id: str, msg_data: dict) -> str:
     primary = msg_data["primary"]
     en_old = msg_data["en_old"]
     en_new = msg_data["en_new"]
     langs = msg_data["langs"]
 
-    parts = [f"**MessageID: {msg_id}**", ""]
+    label = _PRIMARY_LABELS.get(primary, primary)
+    # MessageID is the heading so it appears in the Markdown TOC / outline.
+    # The change type is appended as a suffix for quick scanning.
+    parts = [f"### MessageID: {msg_id} · {label}", ""]
 
     if primary == "added":
-        parts += ["### Added", "", fmt_block("en", en_new)]
+        parts += [fmt_block("en", en_new)]
         parts += _render_langs_plain(langs, "tr_new")
     elif primary == "removed":
-        parts += ["### Removed", "", fmt_block("en", en_old)]
+        parts += [fmt_block("en", en_old)]
         parts += _render_langs_plain(langs, "tr_old")
     elif primary == "src_mod":
-        parts += [
-            "### Source Modified", "",
-            smart_diff_block("en", en_old, en_new)
-        ]
+        parts += [smart_diff_block("en", en_old, en_new)]
         parts += _render_langs_modified(langs)
     elif primary == "tr_mod":
-        parts += ["### Translation Modified", "", fmt_block("en", en_new)]
+        parts += [fmt_block("en", en_new)]
         parts += _render_langs_modified(langs)
 
     return "\n".join(parts) + "\n\n"
