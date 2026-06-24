@@ -158,6 +158,18 @@ def _upload_assets(
 # ---------------------------------------------------------------------------
 
 
+def _publish_release(api_base: str, headers: dict, release_id: int) -> None:
+    """Flip draft → published after all assets are uploaded."""
+    r = requests.patch(
+        f"{api_base}/releases/{release_id}",
+        headers=headers,
+        json={"draft": False},
+        timeout=30,
+    )
+    r.raise_for_status()
+    print(f"Release published (id={release_id}).")
+
+
 def create_release(
     server: str,
     build: int,
@@ -166,11 +178,6 @@ def create_release(
     body: str = "",
     draft: bool = False,
 ) -> str:
-    """
-    Create a GitHub Release and upload assets.
-    Tag format: tq-{build} / sisi-{build}
-    Returns the HTML URL of the created release.
-    """
     repo = _repo()
     headers = _api_headers()
     server_lower = server.lower()
@@ -181,16 +188,19 @@ def create_release(
         "name": f"{server.upper()} Build {build}",
         "body": body
         or f"Localization update for {server.upper()} build {build}.",
-        "draft": draft,
+        "draft": True,
         "prerelease": server_lower == "sisi",
     }
 
     api_base = f"https://api.github.com/repos/{repo}"
     release = _ensure_release(api_base, headers, tag, payload)
 
-    print(f"Release: {release['html_url']}")
+    print(f"Draft release created: {release['html_url']}")
     _upload_assets(release, headers, server_lower, build, changed_langs,
                    changes_md_path)
+
+    if not draft:
+        _publish_release(api_base, headers, release["id"])
 
     return release["html_url"]
 
